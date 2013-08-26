@@ -14,6 +14,7 @@ import java.util.Map;
  */
 public class AuthFilter implements Filter {
 
+    public static final String USER = "user";
     private Consumer consumer;
 
     public void init(FilterConfig config) throws ServletException {
@@ -26,38 +27,64 @@ public class AuthFilter implements Filter {
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse, FilterChain chain) throws IOException, ServletException {
         HttpServletRequest request = (HttpServletRequest) servletRequest;
         HttpServletResponse response = (HttpServletResponse) servletResponse;
-        String user = (String) request.getSession().getAttribute("user");
+        String user = (String) request.getSession().getAttribute(USER);
         boolean isConsumerRequest = request.getRequestURL().toString().equals(consumer.getConsumerUrl());
         boolean isPost = "POST".equals(request.getMethod());
+        boolean isGet = "GET".equals(request.getMethod());
         String responseMessage = request.getParameter("SAMLResponse");
         String consumerRequest = request.getParameter("SAMLRequest");
-        if (user != null && !isConsumerRequest && !isPost) {
-            chain.doFilter(request, response);
-        } else {
-            if (user == null && !isConsumerRequest) {
-                toAuth(request, response);
-            } else if (user == null && isConsumerRequest && isPost && responseMessage != null) {
-                String relayState = request.getParameter("RelayState");
-                Map<String, String> result = consumer.processResponseMessage(responseMessage);
-                if (result != null) {
-                    request.getSession().setAttribute("user", result.get("Subject"));
-                    response.sendRedirect(relayState);
+        if (isConsumerRequest) {
+            if (user == null) {
+                if (isPost) {
+                    if (responseMessage != null) {
+                        String relayState = request.getParameter("RelayState");
+                        Map<String, String> result = consumer.processResponseMessage(responseMessage);
+                        if (result != null) {
+                            request.getSession().setAttribute(USER, result.get("Subject"));
+                            response.sendRedirect(relayState);
+                        } else {
+                            invalidRequest(response);
+                        }
+                    } else if (consumerRequest != null) {
+                        doLogout(request, consumerRequest);
+                    } else {
+                        invalidRequest(response);
+                    }
+                } else {
+                    invalidRequest(response);
                 }
-            } else if (user != null && isConsumerRequest && !isPost) {
-                toLogout(consumerRequest);
-            } else if (user != null && isConsumerRequest && isPost && consumerRequest != null) {
-                doLogout(consumerRequest);
             } else {
-                System.out.println("invalid request");
+                if (isGet && request.getParameter("logout") != null) {
+                    toLogout(request);
+                } else {
+                    invalidRequest(response);
+                }
             }
             return;
+        } else {
+            if (user == null) {
+                toAuth(request, response);
+            } else {
+                chain.doFilter(request, response);
+            }
         }
     }
 
-    private void toLogout(String consumerRequest) {
+    private void invalidRequest(HttpServletResponse response) throws IOException {
+        response.sendError(405, "invalid consumer request");
     }
 
-    private void doLogout(String consumerRequest) {
+    private void toLogout(HttpServletRequest request) throws IOException {
+        consumer.buildRequestMessage(request);
+        request.getSession().removeAttribute(USER);
+    }
+
+    private void doLogout(HttpServletRequest request, String consumerRequest) {
+        Map<String, String> result = consumer.processRequestMessage(consumerRequest);
+        if (result != null)
+            request.getSession().removeAttribute(USER);
+
+
     }
 
     private void toAuth(HttpServletRequest request, HttpServletResponse response) throws IOException {
