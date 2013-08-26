@@ -1,4 +1,4 @@
 *.class
-cloud.iml
+*.iml
 target
 .DS_Store
