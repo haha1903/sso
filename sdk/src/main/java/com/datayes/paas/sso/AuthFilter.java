@@ -1,6 +1,7 @@
 package com.datayes.paas.sso;
 
 import javax.servlet.*;
+import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -16,80 +17,45 @@ public class AuthFilter implements Filter {
 
     public static final String USER = "user";
     private Consumer consumer;
+    private boolean cookie;
 
     public void init(FilterConfig config) throws ServletException {
         String authUrl = config.getInitParameter("authUrl");
         String consumerUrl = config.getInitParameter("consumerUrl");
-        System.out.println(consumerUrl);
-        consumer = new Consumer(authUrl, consumerUrl);
+        cookie = config.getInitParameter("cookie") != null;
+        consumer = new Consumer(authUrl, consumerUrl, cookie);
     }
 
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse, FilterChain chain) throws IOException, ServletException {
         HttpServletRequest request = (HttpServletRequest) servletRequest;
         HttpServletResponse response = (HttpServletResponse) servletResponse;
-        String user = (String) request.getSession().getAttribute(USER);
-        boolean isConsumerRequest = request.getRequestURL().toString().equals(consumer.getConsumerUrl());
-        boolean isPost = "POST".equals(request.getMethod());
-        boolean isGet = "GET".equals(request.getMethod());
-        String responseMessage = request.getParameter("SAMLResponse");
-        String consumerRequest = request.getParameter("SAMLRequest");
-        if (isConsumerRequest) {
-            if (user == null) {
-                if (isPost) {
-                    if (responseMessage != null) {
-                        String relayState = request.getParameter("RelayState");
-                        Map<String, String> result = consumer.processResponseMessage(responseMessage);
-                        if (result != null) {
-                            request.getSession().setAttribute(USER, result.get("Subject"));
-                            response.sendRedirect(relayState);
-                        } else {
-                            invalidRequest(response);
-                        }
-                    } else if (consumerRequest != null) {
-                        doLogout(request, consumerRequest);
-                    } else {
-                        invalidRequest(response);
-                    }
-                } else {
-                    invalidRequest(response);
-                }
-            } else {
-                if (isGet && request.getParameter("logout") != null) {
-                    toLogout(request);
-                } else {
-                    invalidRequest(response);
-                }
-            }
+        setSsoUser(request);
+        boolean processed = consumer.process(request, response);
+        if (processed) {
+            SsoContext.removeUser();
             return;
         } else {
-            if (user == null) {
-                toAuth(request, response);
-            } else {
-                chain.doFilter(request, response);
-            }
+            chain.doFilter(request, response);
+            SsoContext.removeUser();
         }
     }
 
-    private void invalidRequest(HttpServletResponse response) throws IOException {
-        response.sendError(405, "invalid consumer request");
-    }
-
-    private void toLogout(HttpServletRequest request) throws IOException {
-        consumer.buildRequestMessage(request);
-        request.getSession().removeAttribute(USER);
-    }
-
-    private void doLogout(HttpServletRequest request, String consumerRequest) {
-        Map<String, String> result = consumer.processRequestMessage(consumerRequest);
-        if (result != null)
-            request.getSession().removeAttribute(USER);
-
-
-    }
-
-    private void toAuth(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        String url = consumer.buildRequestMessage(request);
-        response.sendRedirect(url);
+    private void setSsoUser(HttpServletRequest request) {
+        if (cookie) {
+            Cookie[] cookies = request.getCookies();
+            for (Cookie c : cookies) {
+                if (USER.equals(c.getName())) {
+                    User user = new User(c.getName());
+                    SsoContext.setUser(user);
+                }
+            }
+        } else {
+            String name = (String) request.getSession().getAttribute(USER);
+            if (name != null) {
+                User user = new User(name);
+                SsoContext.setUser(user);
+            }
+        }
     }
 
     public void destroy() {

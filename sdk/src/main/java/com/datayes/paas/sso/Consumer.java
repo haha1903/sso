@@ -17,28 +17,37 @@ import org.opensaml.xml.util.XMLHelper;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 
+import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSession;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.StringWriter;
 import java.net.URLEncoder;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.Inflater;
+import java.util.zip.InflaterInputStream;
 
 public class Consumer {
-
+    public static final String SAML_LOGOUT_RESPONSE = "saml2p:LogoutResponse";
+    public static final String SAML_LOGOUT_REQUEST = "saml2p:LogoutRequest";
+    private static final String USER = "user";
+    private final String consumerUrl;
+    private final boolean cookie;
     private String authUrl;
-    private String consumerUrl;
     private String AuthReqRandomId = Integer.toHexString(new Double(Math.random()).intValue());
+    private Map<String, HttpSession> userSessions = new ConcurrentHashMap<String, HttpSession>();
 
-    public Consumer(String authUrl, String consumerUrl) {
+    public Consumer(String authUrl, String consumerUrl, boolean cookie) {
         this.authUrl = authUrl;
         this.consumerUrl = consumerUrl;
+        this.cookie = cookie;
         try {
             DefaultBootstrap.bootstrap();
         } catch (ConfigurationException e) {
@@ -46,58 +55,130 @@ public class Consumer {
         }
     }
 
-    public String buildRequestMessage(HttpServletRequest request) throws IOException {
-        RequestAbstractType requestMessage = null;
-        if (request.getParameter("logout") == null) {
-            requestMessage = buildAuthnRequestObject();
+    public boolean process(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        boolean consumerRequest = consumerUrl.equals(request.getRequestURL().toString());
+        User user = SsoContext.getUser();
+        String method = request.getMethod();
+        boolean post = "POST".equals(method);
+        String samlResponse = request.getParameter("SAMLResponse");
+        String samlRequest = request.getParameter("SAMLRequest");
+        if (consumerRequest) {
+            if (post) {
+                if (samlRequest != null) { // single sign out request
+                    doLogout(response, samlRequest);
+                } else if (samlResponse != null) {
+                    XMLObject samlResponseObj = unmarshall(samlResponse);
+                    String samlResponseNodeName = samlResponseObj.getDOM().getNodeName();
+                    if (SAML_LOGOUT_RESPONSE.equals(samlResponseNodeName)) { // logout response
+                        doLogout(request, response);
+                    } else { // login response
+                        doLogin(request, response, samlResponseObj);
+                    }
+                } else {
+                    invalidRequest(response);
+                }
+            } else if (request.getParameter("logout") != null) { // logout request
+                sendLogoutRequest(response, user);
+            } else {
+                invalidRequest(response);
+            }
+            return true;
         } else {
-            requestMessage = buildLogoutRequest((String) request.getSession().getAttribute("user"));
+            if (user == null) { // do auth
+                doAuth(request, response);
+                return true;
+            } else {
+                return false;
+            }
         }
-        String encodedRequestMessage = null;
-        encodedRequestMessage = encodeRequestMessage(requestMessage);
+    }
+
+    private void sendLogoutRequest(HttpServletResponse response, User user) throws IOException {
+        LogoutRequest logoutRequest = buildLogoutRequest(user);
+        response.sendRedirect(authUrl + "?SAMLRequest=" + marshall(logoutRequest) + "&RelayState=");
+    }
+
+    private void doAuth(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        AuthnRequest authRequest = buildAuthRequest();
         String relayState = request.getRequestURL().toString();
         String queryString = request.getQueryString();
-        if (queryString != null)
-            relayState += "?" + queryString;
-
-        return authUrl + "?SAMLRequest=" + encodedRequestMessage + "&RelayState=" + URLEncoder.encode(relayState, "UTF-8");
+        if (queryString != null) relayState += "?" + queryString;
+        String url = authUrl + "?SAMLRequest=" + marshall(authRequest) + "&RelayState=" + URLEncoder.encode(relayState, "UTF-8");
+        response.sendRedirect(url);
     }
 
-    public static void main(String[] args) throws Exception {
-        String s = "fZFBU8IwEIXv/opO7sU0FNpmaJkqMtMZhBlAD95CEmprmtRu6uC/txVR4cB1573d772dTA+Vcj5kA4XRMfIGGDlScyMKncfoaTt3QzRNbibAKkVqujC5ae1avrcSrJPNYqR4XQhevymx46+mLvO8FIpzVYlS5HlRl2IvKi53yMkAWplpsEzbGBHsDV0cuoRscUhxQEk48MfRC3KWxq70qkn3VjaXOo/86daSQc/cNpoaBgVQzSoJ1HK6SR8XlAwwVd+8tAXZIOf5lJL0KbvcGugx1/UldWOs4Uah5FgDXXaSbObMTVMxe93bTwrh7r+lVGpb2M+z29ftDDpy20GjBMDYrvTJ7X+G5PSYjYQ+W6aFPCS+l2ISkXQURA+zlPjpfeCNA39054+iMJoPf3ZcuH6nZ09OvgA=";
-        Consumer consumer = new Consumer("a", "b");
-        XMLObject unmarshall = consumer.unmarshall(s);
-        System.out.println(unmarshall);
+    private void doLogin(HttpServletRequest request, HttpServletResponse response, XMLObject samlResponseObj) throws IOException {
+        String relayState = request.getParameter("RelayState");
+        Response resp = (Response) samlResponseObj;
+
+        Assertion assertion = resp.getAssertions().get(0);
+        Map<String, String> attributes = new HashMap<String, String>();
+        String name = null;
+        if (assertion != null) {
+            name = assertion.getSubject().getNameID().getValue();
+            List<AttributeStatement> attributeStatementList = assertion.getAttributeStatements();
+            if (attributeStatementList != null) {
+                // we have received attributes of user
+                for (AttributeStatement statment : attributeStatementList) {
+                    List<Attribute> attributesList = statment.getAttributes();
+                    for (Attribute attrib : attributesList) {
+                        Element value = attrib.getAttributeValues().get(0).getDOM();
+                        String attribValue = value.getTextContent();
+                        attributes.put(attrib.getName(), attribValue);
+                    }
+                }
+            }
+        }
+        if (name == null) {
+            throw new IOException("sso login, user is null");
+        } else {
+            setUserContext(request, response, name);
+            response.sendRedirect(relayState);
+        }
     }
 
-    private LogoutRequest buildLogoutRequest(String user) {
-        LogoutRequest logoutReq = new LogoutRequestBuilder().buildObject();
-        logoutReq.setID(Util.createID());
-
-        DateTime issueInstant = new DateTime();
-        logoutReq.setIssueInstant(issueInstant);
-        logoutReq.setNotOnOrAfter(new DateTime(issueInstant.getMillis() + 5 * 60 * 1000));
-
-        IssuerBuilder issuerBuilder = new IssuerBuilder();
-        Issuer issuer = issuerBuilder.buildObject();
-        issuer.setValue(consumerUrl);
-        logoutReq.setIssuer(issuer);
-
-        NameID nameId = new NameIDBuilder().buildObject();
-        nameId.setFormat("urn:oasis:names:tc:SAML:2.0:nameid-format:entity");
-        nameId.setValue(user);
-        logoutReq.setNameID(nameId);
-
-        SessionIndex sessionIndex = new SessionIndexBuilder().buildObject();
-        sessionIndex.setSessionIndex(UUID.randomUUID().toString());
-        logoutReq.getSessionIndexes().add(sessionIndex);
-
-        logoutReq.setReason("Single Logout");
-
-        return logoutReq;
+    private void setUserContext(HttpServletRequest request, HttpServletResponse response, String name) {
+        if (cookie) {
+            Cookie c = new Cookie(USER, name);
+            response.addCookie(c);
+        } else {
+            request.getSession().setAttribute(USER, name);
+        }
+        userSessions.put(name, request.getSession(false));
     }
 
-    private AuthnRequest buildAuthnRequestObject() {
+    private void doLogout(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        HttpSession session = request.getSession(false);
+        if (session != null)
+            session.invalidate();
+        response.sendRedirect(request.getContextPath());
+    }
+
+    private void doLogout(HttpServletResponse response, String samlRequest) throws IOException {
+        XMLObject samlRequestObj = unmarshall(samlRequest);
+        if (!SAML_LOGOUT_REQUEST.equals(samlRequestObj.getDOM().getNodeName()))
+            throw new IOException("invalid do logout request");
+        String name = ((LogoutRequestImpl) samlRequestObj).getNameID().getValue();
+        removeUserContext(response, name);
+    }
+
+    private void removeUserContext(HttpServletResponse response, String name) {
+        if (cookie) {
+            Cookie c = new Cookie(USER, name);
+            c.setMaxAge(0);
+            c.setPath("/");
+            response.addCookie(c);
+        } else {
+            userSessions.get(name).invalidate();
+            userSessions.remove(name);
+        }
+    }
+
+    private void invalidRequest(HttpServletResponse response) throws IOException {
+        response.sendError(405, "invalid consumer request");
+    }
+
+    private AuthnRequest buildAuthRequest() {
         IssuerBuilder issuerBuilder = new IssuerBuilder();
         Issuer issuer = issuerBuilder.buildObject("urn:oasis:names:tc:SAML:2.0:assertion", "Issuer", "samlp");
         issuer.setValue(consumerUrl);
@@ -106,33 +187,25 @@ public class Consumer {
         NameIDPolicy nameIdPolicy = nameIdPolicyBuilder.buildObject();
         nameIdPolicy.setFormat("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent");
         nameIdPolicy.setSPNameQualifier("Isser");
-        nameIdPolicy.setAllowCreate(new Boolean(true));
+        nameIdPolicy.setAllowCreate(Boolean.TRUE);
 
 		/* AuthnContextClass */
         AuthnContextClassRefBuilder authnContextClassRefBuilder = new AuthnContextClassRefBuilder();
-        AuthnContextClassRef authnContextClassRef =
-                authnContextClassRefBuilder.buildObject("urn:oasis:names:tc:SAML:2.0:assertion",
-                        "AuthnContextClassRef",
-                        "saml");
+        AuthnContextClassRef authnContextClassRef = authnContextClassRefBuilder.buildObject("urn:oasis:names:tc:SAML:2.0:assertion", "AuthnContextClassRef", "saml");
         authnContextClassRef.setAuthnContextClassRef("urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport");
 
 		/* AuthnContex */
-        RequestedAuthnContextBuilder requestedAuthnContextBuilder =
-                new RequestedAuthnContextBuilder();
+        RequestedAuthnContextBuilder requestedAuthnContextBuilder = new RequestedAuthnContextBuilder();
         RequestedAuthnContext requestedAuthnContext = requestedAuthnContextBuilder.buildObject();
         requestedAuthnContext.setComparison(AuthnContextComparisonTypeEnumeration.EXACT);
         requestedAuthnContext.getAuthnContextClassRefs().add(authnContextClassRef);
 
-        DateTime issueInstant = new DateTime();
-
-		/* Creation of AuthRequestObject */
+        /* Creation of AuthRequestObject */
         AuthnRequestBuilder authRequestBuilder = new AuthnRequestBuilder();
-        AuthnRequest authRequest =
-                authRequestBuilder.buildObject("urn:oasis:names:tc:SAML:2.0:protocol",
-                        "AuthnRequest", "samlp");
-        authRequest.setForceAuthn(new Boolean(false));
-        authRequest.setIsPassive(new Boolean(false));
-        authRequest.setIssueInstant(issueInstant);
+        AuthnRequest authRequest = authRequestBuilder.buildObject("urn:oasis:names:tc:SAML:2.0:protocol", "AuthnRequest", "samlp");
+        authRequest.setForceAuthn(Boolean.FALSE);
+        authRequest.setIsPassive(Boolean.FALSE);
+        authRequest.setIssueInstant(new DateTime());
         authRequest.setProtocolBinding("urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST");
         authRequest.setAssertionConsumerServiceURL(consumerUrl);
         authRequest.setIssuer(issuer);
@@ -146,169 +219,86 @@ public class Consumer {
         if (index != null && !index.equals("")) {
             authRequest.setAttributeConsumingServiceIndex(Integer.parseInt(index));
         }*/
-
         return authRequest;
     }
 
-    private String encodeRequestMessage(RequestAbstractType requestMessage) throws IOException {
+    private String marshall(RequestAbstractType request) throws IOException {
         try {
-            Marshaller marshaller = Configuration.getMarshallerFactory().getMarshaller(requestMessage);
-            Element authDOM = marshaller.marshall(requestMessage);
+            Marshaller marshaller = Configuration.getMarshallerFactory().getMarshaller(request);
+            Element dom = marshaller.marshall(request);
 
             Deflater deflater = new Deflater(Deflater.DEFLATED, true);
-            ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-            DeflaterOutputStream deflaterOutputStream =
-                    new DeflaterOutputStream(byteArrayOutputStream,
-                            deflater);
+            ByteArrayOutputStream byteArrayOut = new ByteArrayOutputStream();
+            DeflaterOutputStream deflaterOut = new DeflaterOutputStream(byteArrayOut, deflater);
 
-            StringWriter rspWrt = new StringWriter();
-            XMLHelper.writeNode(authDOM, rspWrt);
-            deflaterOutputStream.write(rspWrt.toString().getBytes());
-            deflaterOutputStream.close();
+            XMLHelper.writeNode(dom, deflaterOut);
+            deflaterOut.close();
 
-		/* Encoding the compressed message */
-            String encodedRequestMessage =
-                    Base64.encodeBytes(byteArrayOutputStream.toByteArray(),
-                            Base64.DONT_BREAK_LINES);
-            return URLEncoder.encode(encodedRequestMessage, "UTF-8").trim();
+            String message = Base64.encodeBytes(byteArrayOut.toByteArray(), Base64.DONT_BREAK_LINES);
+            return URLEncoder.encode(message, "UTF-8").trim();
         } catch (MarshallingException e) {
-            throw new RuntimeException(e);
+            throw new IOException("encode request failure", e);
         }
     }
 
-    public Map<String, String> processResponseMessage(String responseMessage) {
+    private LogoutRequest buildLogoutRequest(User user) {
+        LogoutRequest logoutReq = new LogoutRequestBuilder().buildObject();
+        logoutReq.setID(createID());
+
+        DateTime issueInstant = new DateTime();
+        logoutReq.setIssueInstant(issueInstant);
+        logoutReq.setNotOnOrAfter(new DateTime(issueInstant.getMillis() + 5 * 60 * 1000));
+
+        IssuerBuilder issuerBuilder = new IssuerBuilder();
+        Issuer issuer = issuerBuilder.buildObject();
+        issuer.setValue(consumerUrl);
+        logoutReq.setIssuer(issuer);
+
+        NameID nameId = new NameIDBuilder().buildObject();
+        nameId.setFormat("urn:oasis:names:tc:SAML:2.0:nameid-format:entity");
+        nameId.setValue(user.getName());
+        logoutReq.setNameID(nameId);
+
+        SessionIndex sessionIndex = new SessionIndexBuilder().buildObject();
+        sessionIndex.setSessionIndex(UUID.randomUUID().toString());
+        logoutReq.getSessionIndexes().add(sessionIndex);
+
+        logoutReq.setReason("Single Logout");
+
+        return logoutReq;
+    }
+
+    private String createID() {
+        byte[] bytes = new byte[20];
+        new Random().nextBytes(bytes);
+        char[] charMapping = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p'};
+        char[] chars = new char[40];
+        for (int i = 0; i < bytes.length; i++) {
+            int left = (bytes[i] >> 4) & 0x0f;
+            int right = bytes[i] & 0x0f;
+            chars[i * 2] = charMapping[left];
+            chars[i * 2 + 1] = charMapping[right];
+        }
+        return String.valueOf(chars);
+    }
+
+    private XMLObject unmarshall(String message) throws IOException {
         try {
-            XMLObject responseXmlObj = unmarshall(responseMessage);
-            return getResult(responseXmlObj);
+            DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
+            documentBuilderFactory.setNamespaceAware(true);
+            DocumentBuilder docBuilder = documentBuilderFactory.newDocumentBuilder();
+
+            Inflater inflater = new Inflater(true);
+            InflaterInputStream inflaterIn = new InflaterInputStream(new ByteArrayInputStream(Base64.decode(message)), inflater);
+
+            Document document = docBuilder.parse(inflaterIn);
+            inflaterIn.close();
+            Element element = document.getDocumentElement();
+            UnmarshallerFactory unmarshallerFactory = Configuration.getUnmarshallerFactory();
+            Unmarshaller unmarshaller = unmarshallerFactory.getUnmarshaller(element);
+            return unmarshaller.unmarshall(element);
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            throw new IOException("unmarshall message failure, message: \n" + message, e);
         }
-    }
-
-    public Map<String, String> processRequestMessage(String samlRequest) {
-        try {
-            XMLObject requestXmlObj = unmarshall(samlRequest);
-
-            if (requestXmlObj.getDOM().getNodeName().equals("saml2p:LogoutResponse")) {
-                return null;
-            }
-
-            Response response = (Response) requestXmlObj;
-
-            Assertion assertion = response.getAssertions().get(0);
-            Map<String, String> resutls = new HashMap<String, String>();
-
-		/*
-         * If the request has failed, the IDP shouldn't send an assertion.
-		 * SSO profile spec 4.1.4.2 <Response> Usage
-		 */
-            if (assertion != null) {
-
-                String subject = assertion.getSubject().getNameID().getValue();
-                resutls.put("Subject", subject); // get the subject
-
-                List<AttributeStatement> attributeStatementList = assertion.getAttributeStatements();
-
-                if (attributeStatementList != null) {
-                    // we have received attributes of user
-                    Iterator<AttributeStatement> attribStatIter = attributeStatementList.iterator();
-                    while (attribStatIter.hasNext()) {
-                        AttributeStatement statment = attribStatIter.next();
-                        List<Attribute> attributesList = statment.getAttributes();
-                        Iterator<Attribute> attributesIter = attributesList.iterator();
-                        while (attributesIter.hasNext()) {
-                            Attribute attrib = attributesIter.next();
-                            Element value = attrib.getAttributeValues().get(0).getDOM();
-                            String attribValue = value.getTextContent();
-                            resutls.put(attrib.getName(), attribValue);
-                        }
-                    }
-                }
-            }
-            return resutls;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private XMLObject unmarshall(String responseMessage) throws Exception {
-
-        org.apache.commons.codec.binary.Base64 base64Decoder =
-                new org.apache.commons.codec.binary.Base64();
-
-        DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
-        documentBuilderFactory.setNamespaceAware(true);
-        DocumentBuilder docBuilder = documentBuilderFactory.newDocumentBuilder();
-
-        byte[] xmlBytes = base64Decoder.decode(responseMessage.getBytes("UTF-8"));
-
-        Inflater inflater = new Inflater(true);
-        inflater.setInput(xmlBytes);
-        byte[] xmlMessageBytes = new byte[5000];
-        int resultLength = inflater.inflate(xmlMessageBytes);
-
-        if (inflater.getRemaining() > 0) {
-            throw new RuntimeException("didn't allocate enough space to hold "
-                    + "decompressed data");
-        }
-
-        inflater.end();
-        //String decodedString = new String(xmlMessageBytes, 0, resultLength, "UTF-8");
-
-        ByteArrayInputStream is = new ByteArrayInputStream(xmlMessageBytes, 0, resultLength);// (decodedString.getBytes("UTF-8"));  
-        Document document = docBuilder.parse(is);//(decodedString);
-        Element element = document.getDocumentElement();
-        UnmarshallerFactory unmarshallerFactory = Configuration.getUnmarshallerFactory();
-        Unmarshaller unmarshaller = unmarshallerFactory.getUnmarshaller(element);
-        return unmarshaller.unmarshall(element);
-
-    }
-
-    /*
-     * Process the response and returns the results
-     */
-    private Map<String, String> getResult(XMLObject responseXmlObj) {
-
-        if (responseXmlObj.getDOM().getNodeName().equals("saml2p:LogoutResponse")) {
-            return null;
-        }
-
-        Response response = (Response) responseXmlObj;
-
-        Assertion assertion = response.getAssertions().get(0);
-        Map<String, String> resutls = new HashMap<String, String>();
-
-		/*
-         * If the request has failed, the IDP shouldn't send an assertion.
-		 * SSO profile spec 4.1.4.2 <Response> Usage
-		 */
-        if (assertion != null) {
-
-            String subject = assertion.getSubject().getNameID().getValue();
-            resutls.put("Subject", subject); // get the subject
-
-            List<AttributeStatement> attributeStatementList = assertion.getAttributeStatements();
-
-            if (attributeStatementList != null) {
-                // we have received attributes of user
-                Iterator<AttributeStatement> attribStatIter = attributeStatementList.iterator();
-                while (attribStatIter.hasNext()) {
-                    AttributeStatement statment = attribStatIter.next();
-                    List<Attribute> attributesList = statment.getAttributes();
-                    Iterator<Attribute> attributesIter = attributesList.iterator();
-                    while (attributesIter.hasNext()) {
-                        Attribute attrib = attributesIter.next();
-                        Element value = attrib.getAttributeValues().get(0).getDOM();
-                        String attribValue = value.getTextContent();
-                        resutls.put(attrib.getName(), attribValue);
-                    }
-                }
-            }
-        }
-        return resutls;
-    }
-
-    public String getConsumerUrl() {
-        return consumerUrl;
     }
 }
